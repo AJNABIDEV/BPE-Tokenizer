@@ -1,71 +1,76 @@
-import heapq
-from BPE_Engine import BPEMergeEngine
-from Frequency_counter import FrequencyCounter
-from Save_files import FileSaver
+from __future__ import annotations
+
+from .decoder import Decoder
+from .encoder import Encoder
+from .exceptions import TokenizerError
+from .serialization import Serializer
+from .trainer import Trainer
+from .utils import Pair, build_vocab, get_logger
+
+logger = get_logger(__name__)
 
 
-class BPETokenizer:
+class Tokenizer:
+    __slots__ = ("_merges", "_vocab", "_encoder", "_decoder")
 
-    def __init__(self, text: str = "", file_path: str = "") -> None:
-        if not text and not file_path:
-            raise ValueError("Provide `text` or `file_path`.")
-
-        self._merges: dict[tuple[int, int], int] = {}
+    def __init__(self) -> None:
+        self._merges: dict[Pair, int] = {}
         self._vocab: dict[int, bytes] = {}
-        self._merge_rank: dict[tuple[int, int], int] = {}
-        self._source = file_path if file_path else text
-        self._is_file = bool(file_path)
+        self._encoder: Encoder | None = None
+        self._decoder: Decoder | None = None
 
-    def train(self, num_merges: int = 256) -> "BPETokenizer":
-        fc_kw = {"file_path": self._source} if self._is_file else {"text": self._source}
-        word_freqs = FrequencyCounter(**fc_kw).count_frequencies()
-
-        engine = BPEMergeEngine()
-        raw_merges = engine.generate_merges(word_freqs, num_merges)
-
-        self._merges = {tuple(map(int, k.split())): v for k, v in raw_merges.items()}
-        self._merge_rank = {pair: idx for idx, pair in enumerate(self._merges)}
-        self._vocab = {i: bytes([i]) for i in range(256)}
-        for (a, b), idx in self._merges.items():
-            self._vocab[idx] = self._vocab[a] + self._vocab[b]
-
-        return self
-
-    def load(self, output_dir: str | None = None) -> "BPETokenizer":
-        raw = FileSaver.load_merges(output_dir=output_dir)
-        self._merges = {tuple(map(int, k.split())): v for k, v in raw.items()}
-        self._merge_rank = {pair: idx for idx, pair in enumerate(self._merges)}
-        self._vocab = {i: bytes([i]) for i in range(256)}
-        for (a, b), idx in self._merges.items():
-            self._vocab[idx] = self._vocab[a] + self._vocab[b]
+    def train(
+        self,
+        file_path: str = "",
+        text: str = "",
+        num_merges: int = 1000,
+        min_frequency: int = 2,
+        use_cache: bool = True,
+        cache_dir: str | None = None,
+    ) -> "Tokenizer":
+        merges, vocab = Trainer(cache_dir).train(
+            text=text,
+            file_path=file_path,
+            num_merges=num_merges,
+            min_frequency=min_frequency,
+            use_cache=use_cache,
+        )
+        self._merges = merges
+        self._vocab = vocab
+        self._encoder = Encoder(merges)
+        self._decoder = Decoder(merges)
         return self
 
     def encode(self, text: str) -> list[int]:
-        ids: list[int] = list(text.encode("utf-8"))
-        if len(ids) < 2 or not self._merges:
-            return ids
-
-        heap: list[tuple[int, int]] = []
-        for i in range(len(ids) - 1):
-            pair = (ids[i], ids[i + 1])
-            if pair in self._merge_rank:
-                heapq.heappush(heap, (self._merge_rank[pair], i))
-
-        while heap:
-            rank, pos = heapq.heappop(heap)
-            if pos >= len(ids) - 1:
-                continue
-            pair = (ids[pos], ids[pos + 1])
-            if self._merge_rank.get(pair) != rank:
-                continue
-            ids[pos:pos + 2] = [self._merges[pair]]
-            for cp in (pos - 1, pos):
-                if 0 <= cp < len(ids) - 1:
-                    cpair = (ids[cp], ids[cp + 1])
-                    if cpair in self._merge_rank:
-                        heapq.heappush(heap, (self._merge_rank[cpair], cp))
-
-        return ids
+        if self._encoder is None:
+            raise TokenizerError("Tokenizer not trained or loaded.")
+        return self._encoder.encode(text)
 
     def decode(self, ids: list[int]) -> str:
-        return b"".join(self._vocab[i] for i in ids).decode("utf-8", errors="replace")
+        if self._decoder is None:
+            raise TokenizerError("Tokenizer not trained or loaded.")
+        return self._decoder.decode(ids)
+
+    def save(self, output_dir: str = "model") -> None:
+        if not self._merges:
+            raise TokenizerError("Nothing to save: tokenizer not trained or loaded.")
+        Serializer.save_merges(self._merges, output_dir=output_dir)
+        Serializer.save_vocab(self._vocab, output_dir=output_dir)
+        Serializer.save_metadata(
+            {"vocab_size": len(self._vocab), "num_merges": len(self._merges)},
+            output_dir=output_dir,
+        )
+        logger.info("tokenizer saved -> %s", output_dir)
+
+    def load(self, output_dir: str = "model") -> "Tokenizer":
+        merges = Serializer.load_merges(output_dir=output_dir)
+        self._merges = merges
+        self._vocab = build_vocab(merges)
+        self._encoder = Encoder(merges)
+        self._decoder = Decoder(merges)
+        logger.info("tokenizer loaded <- %s", output_dir)
+        return self
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self._vocab)

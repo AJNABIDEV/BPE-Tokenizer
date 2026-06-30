@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 import numpy as np
-
+import pprint
 
 class FileSaver:
     """
@@ -73,32 +73,23 @@ class FileSaver:
         with open(path, "r", encoding="utf-8") as f:
             raw = json.load(f)
         return raw.get("data", raw)
-    
+
+
     @staticmethod
+    def save_merges_to_bin(merges, filename="token_ids.bin"):
 
-    # Maan lo 'token_ids' tumhari wo list hai jisme numbers hain (e.g., [256, 455, 82])
-    # filename = "train_data.bin"
+        token_ids = np.array(list(merges.values()), dtype=np.uint32)
 
-    def save_tokens_to_bin(token_ids, filename="train_data.bin"):
-        # 1. List ko memory-efficient NumPy array me badlo
-        np_array = np.array(token_ids, dtype=np.uint16)
-        
-        # 2. 'ab' (Append Binary) mode me file kholo aur direct bytes write kar do
-        with open(filename, "ab") as f:
-            f.write(np_array.tobytes())
+        token_ids.tofile(filename)
+
+        print(f"Saved {len(token_ids)} token IDs.")
+
 
     @staticmethod
     def save_merges(merges: dict, filename: str = "merges.json", output_dir: str | None = None) -> None:
-        serializable_merges = {}
-        for k, v in merges.items():
-            if isinstance(k, tuple):
-                serializable_merges[" ".join(map(str, k))] = v
-            else:
-                serializable_merges[str(k)] = v
-
-        path = FileSaver._resolve(filename, output_dir)
-        FileSaver._atomic_write_json(serializable_merges, path)
-        print(f"[SAVED] merges → {path}")
+        with open(filename, "w", encoding="utf-8") as f:
+                    formatted_data = pprint.pformat(merges, indent=4)
+                    f.write(formatted_data)
 
     @staticmethod
     def load_merges(filename: str = "merges.json", output_dir: str | None = None) -> dict:

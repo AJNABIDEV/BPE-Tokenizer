@@ -1,138 +1,121 @@
-# --- bpe_engine.py ---
+from __future__ import annotations
+
+import gc
 import heapq
 from collections import defaultdict
-from Frequency_counter import FrequencyCounter
-from datasets import load_dataset
-from Save_files import FileSaver
-from tqdm import tqdm
+import tqdm
+from .exceptions import TrainingError
+from .utils import Pair, Word, get_logger
 
-class BPEMergeEngine:
-    def __init__(self):
-        self.merges = {}
-        self.next_id = 256
-        self.pair_freqs = defaultdict(int)
-        self.pair_to_words = defaultdict(set) 
-        self.heap = []
-        self.word_freqs = {} # word_tuple: count
+logger = get_logger(__name__)
 
-    def _get_pairs(self, word: tuple[int, ...]):
-        return [(word[i], word[i + 1]) for i in range(len(word) - 1)]
 
-    def generate_merges(self, word_freqs: dict[tuple[int, ...], int], num_merges: int):
-        self.word_freqs = word_freqs
-        
-        # 1. Initial count of all pairs
-        for word, count in self.word_freqs.items():
-            for pair in self._get_pairs(word):
-                self.pair_freqs[pair] += count
-                self.pair_to_words[pair].add(word)
+class BPEEngine:
+    __slots__ = ("merges", "_next_id")
 
-        # 2. Build initial heap
-        for pair, freq in self.pair_freqs.items():
-            heapq.heappush(self.heap, (-freq, pair))
+    def __init__(self, vocab_base_size: int = 256) -> None:
+        self.merges: dict[Pair, int] = {}
+        self._next_id = vocab_base_size
 
-        # 3. Main Merge Loop
-        for i in tqdm(range(num_merges), desc="Training BPE"): 
-            best_pair = None
-            
-            # Lazy Deletion: Find the real best pair
-            while self.heap:
-                freq, pair = heapq.heappop(self.heap)
-                if -freq == self.pair_freqs.get(pair, 0):
-                    best_pair = pair
+    @staticmethod
+    def _pair_freqs(wf: dict[Word, int]) -> dict[Pair, int]:
+        pairs: defaultdict[Pair, int] = defaultdict(int)
+        for word, cnt in wf.items():
+            for i in range(len(word) - 1):
+                pairs[(word[i], word[i + 1])] += cnt
+        return dict(pairs)
+
+    @staticmethod
+    def _build_index(wf: dict[Word, int]) -> dict[Pair, set[Word]]:
+        idx: defaultdict[Pair, set[Word]] = defaultdict(set)
+        for word in wf:
+            for i in range(len(word) - 1):
+                idx[(word[i], word[i + 1])].add(word)
+        return idx
+
+    @staticmethod
+    def _merge_incremental(
+        wf: dict[Word, int],
+        pf: dict[Pair, int],
+        idx: dict[Pair, set[Word]],
+        pair: Pair,
+        new_id: int,
+    ) -> set[Pair]:
+        p0, p1 = pair
+        affected: set[Pair] = set()
+        for word in list(idx.get(pair, ())):
+            cnt = wf.get(word, 0)
+            if not cnt:
+                continue
+            for j in range(len(word) - 1):
+                p = (word[j], word[j + 1])
+                pf[p] = pf.get(p, 0) - cnt
+                if pf[p] <= 0:
+                    pf.pop(p, None)
+                idx[p].discard(word)
+                affected.add(p)
+            out: list[int] = []
+            i = 0
+            length = len(word)
+            while i < length:
+                if i < length - 1 and word[i] == p0 and word[i + 1] == p1:
+                    out.append(new_id)
+                    i += 2
+                else:
+                    out.append(word[i])
+                    i += 1
+            new_word: Word = tuple(out)
+            for j in range(len(new_word) - 1):
+                p = (new_word[j], new_word[j + 1])
+                pf[p] = pf.get(p, 0) + cnt
+                idx[p].add(new_word)
+                affected.add(p)
+            wf[new_word] = wf.get(new_word, 0) + cnt
+            del wf[word]
+        return affected
+
+    def train(
+        self,
+        word_freqs: dict[Word, int],
+        num_merges: int,
+        min_frequency: int = 2,
+        progress_every: int = 10000,
+    ) -> dict[Pair, int]:
+        if num_merges <= 0:
+            raise TrainingError("num_merges must be positive.")
+
+        wf = {k: v for k, v in word_freqs.items() if v >= min_frequency}
+        pf = self._pair_freqs(wf)
+        if not pf:
+            return self.merges
+
+        idx = self._build_index(wf)
+        heap = [(-f, p) for p, f in pf.items()]
+        heapq.heapify(heap)
+
+        for i in tqdm.tqdm(range(num_merges), desc="Training BPE"):
+            best: Pair | None = None
+            while heap:
+                neg_f, cand = heapq.heappop(heap)
+                if pf.get(cand, 0) == -neg_f:
+                    best = cand
                     break
-            
-            if not best_pair or self.pair_freqs[best_pair] == 0:
-                print(f"No more merges possible at {i}.")
+            if best is None:
                 break
 
-            if (i + 1) % 500 == 0:
-                print(f"\nMerge {i+1}: Best Pair {best_pair} with freq {-freq}")
+            new_id = self._next_id
+            self.merges[best] = new_id
+            affected = self._merge_incremental(wf, pf, idx, best, new_id)
+            self._next_id += 1
 
-            # Update merges map
-            self.merges[best_pair] = self.next_id
-            p0, p1 = best_pair
-            
-            # 4. Targetted Update: Only update words that contain the pair
-            words_to_update = list(self.pair_to_words[best_pair])
-            
-            for word in words_to_update:
-                if word not in self.word_freqs: continue
-                
-                count = self.word_freqs.pop(word)
-                
-                # Remove old pairs count
-                for pair in self._get_pairs(word):
-                    self.pair_freqs[pair] -= count
-                    self.pair_to_words[pair].discard(word)
-                
-                # Perform Merge in the word
-                new_word = []
-                idx = 0
-                while idx < len(word):
-                    if idx < len(word) - 1 and word[idx] == p0 and word[idx+1] == p1:
-                        new_word.append(self.next_id)
-                        idx += 2
-                    else:
-                        new_word.append(word[idx])
-                        idx += 1
-                new_word = tuple(new_word)
-                
-                # Add back to word_freqs
-                self.word_freqs[new_word] = self.word_freqs.get(new_word, 0) + count
-                
-                # Add new pairs count
-                for pair in self._get_pairs(new_word):
-                    self.pair_freqs[pair] += count
-                    self.pair_to_words[pair].add(new_word)
-                    heapq.heappush(self.heap, (-self.pair_freqs[pair], pair))
-            
-            self.next_id += 1
-            if (i + 1) % 100 == 0: print(f"Merge {i + 1}/{num_merges} done.")
+            for p in affected:
+                f = pf.get(p, 0)
+                if f > 0:
+                    heapq.heappush(heap, (-f, p))
 
+            if progress_every and (i + 1) % progress_every == 0:
+                logger.info("merge %d/%d, vocab_size=%d", i + 1, num_merges, self._next_id - 1)
+
+        del wf, pf, idx, heap
+        gc.collect()
         return self.merges
-
-# print("Cloud se data stream ho raha hai...")
-# dataset = load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True, token=True)
-
-# temp_text_file = "tokenizer_training_data.txt"
-# target_conversations = 10000 # 10,000 baatein kaafi hain seekhne ke liye
-
-# with open(temp_text_file, "w", encoding="utf-8") as f:
-#     for count, sample in enumerate(dataset):
-#         if count >= target_conversations:
-#             break
-            
-#         conversations = sample.get('conversations', [])
-#         for turn in conversations:
-#             # Har line ko text file me likh rahe hain
-#             f.write(turn.get('value', '') + "\n")
-
-# print(f"Data '{temp_text_file}' me save ho gaya!")
-
-# ==========================================
-# STEP 2: Tokenizer ko us File se Train Karna
-# ==========================================
-# ... (Purana code)
-
-# STEP 2: Tokenizer ko us File se Train Karna
-print("Words ki frequency count kar rahe hain...")
-f = r"C:\Users\jatin\OneDrive\Documents\Work_related\train.txt"
-FC = FrequencyCounter(file_path=f)
-word_freq = FC.count_frequencies()
-
-# --- YAHAN FIX KARO: Convert strings to integers ---
-normalized_word_freq = {}
-for word_tuple, count in word_freq.items():
-    # Saare characters ko integers mein convert kar rahe hain (ASCII/Unicode)
-    int_word = tuple(ord(char) for char in word_tuple)
-    normalized_word_freq[int_word] = count
-# ----------------------------------------------------
-
-print("BPE Merges generate ho rahe hain...")
-BPE = BPEMergeEngine()
-
-# Naya normalized data bhejo
-WE = BPE.generate_merges(word_freqs=normalized_word_freq, num_merges=20000)
-
-print("[SUCCESS] Tumhara Tokenizer tayyar hai!")
